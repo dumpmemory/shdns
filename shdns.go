@@ -366,9 +366,15 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 				}
 			} else {
 				// chAnswer is closed
-				if !answered && failedAnswer != nil {
-					if _, err := inConn.WriteToUDP(failedAnswer, addr); err != nil {
-						errlog.Println(err)
+				if !answered {
+					if failedAnswer != nil {
+						if _, err := inConn.WriteToUDP(failedAnswer, addr); err != nil {
+							errlog.Println(err)
+						}
+					} else {
+						// warn user that no answer is returned
+						q := qs[0]
+						errlog.Printf("%d Timeout for Query[%s] %s", h.ID, strings.TrimPrefix(q.Type.String(), "Type"), q.Name.String())
 					}
 				}
 				if *verbose {
