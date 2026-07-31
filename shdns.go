@@ -124,6 +124,10 @@ func main() {
 		ipsetInit()
 		defer ipsetClose()
 	}
+	if len(nftSetSpecs) > 0 {
+		nftInit()
+		defer nftClose()
+	}
 
 	addr, err := parseUDPAddr(*localnet)
 	if err != nil {

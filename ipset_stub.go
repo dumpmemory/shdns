@@ -5,12 +5,8 @@ package main
 
 import "net"
 
-var ipsetSock int = -1
-
 func ipsetInit() {}
 
 func ipsetClose() {}
 
-func ipsetAddToSet(name string, ip net.IP) error {
-	return nil
-}
+func ipsetAddElements(name string, ips []net.IP, qName string, id uint16) {}

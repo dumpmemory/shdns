@@ -20,7 +20,6 @@ package main
 import (
 	"fmt"
 	"net"
-	"os/exec"
 	"strings"
 )
 
@@ -65,7 +64,7 @@ func parseSetDomains(spec string) (domains []string, names []string) {
 	}
 	for _, p := range parts[1 : len(parts)-1] {
 		if p != "" {
-			domains = append(domains, p)
+			domains = append(domains, strings.ToLower(p))
 		}
 	}
 	return
@@ -75,7 +74,7 @@ func domainMatch(qName string, domains []string) bool {
 	if len(domains) == 0 {
 		return true
 	}
-	name := strings.TrimSuffix(qName, ".")
+	name := strings.ToLower(strings.TrimSuffix(qName, "."))
 	for _, d := range domains {
 		if name == d || strings.HasSuffix(name, "."+d) {
 			return true
@@ -117,45 +116,56 @@ func parseNFTSetSpec(spec string) (nftSetConfig, error) {
 	return cfg, nil
 }
 
+type nftSetKey struct {
+	family  string
+	table   string
+	setName string
+}
+
 func addIPsToSet(ips []net.IP, qName string, id uint16) {
 	if len(ips) == 0 {
 		return
 	}
-	seen := make(map[string]bool)
-	for _, ip := range ips {
-		s := ip.String()
-		if seen[s] {
-			continue
-		}
-		seen[s] = true
-		is4 := ip.To4() != nil
-		for _, spec := range ipsetSpecs {
-			if !domainMatch(qName, spec.domains) {
-				continue
-			}
-			if err := ipsetAddToSet(spec.setName, ip); err != nil {
-				errlog.Printf("ipset add %s %s: %v", spec.setName, s, err)
-			} else if *verbose {
-				logger.Printf("%d ipset %s <- %s (%s)", id, spec.setName, s, qName)
+
+	if len(ipsetSpecs) > 0 {
+		batches := make(map[string][]net.IP)
+		for _, ip := range ips {
+			for _, spec := range ipsetSpecs {
+				if domainMatch(qName, spec.domains) {
+					batches[spec.setName] = append(batches[spec.setName], ip)
+				}
 			}
 		}
-		for _, spec := range nftSetSpecs {
-			if !domainMatch(qName, spec.domains) {
-				continue
-			}
-			set := spec.config
-			if (is4 && set.family == "ip6") || (!is4 && set.family == "ip") {
-				continue
-			}
-			if set.v4Only && !is4 || set.v6Only && is4 {
-				continue
-			}
-			cmd := exec.Command("nft", "add", "element", set.family, set.table, set.setName, "{", s, "}")
-			if err := cmd.Run(); err != nil {
-				errlog.Printf("nft add element %s %s %s { %s }: %v", set.family, set.table, set.setName, s, err)
-			} else if *verbose {
-				logger.Printf("%d nftset %s#%s#%s <- %s (%s)", id, set.family, set.table, set.setName, s, qName)
+		for name, batch := range batches {
+			ipsetAddElements(name, batch, qName, id)
+		}
+	}
+
+	if len(nftSetSpecs) > 0 {
+		batches := make(map[nftSetKey][]net.IP)
+		for _, ip := range ips {
+			is4 := ip.To4() != nil
+			for _, spec := range nftSetSpecs {
+				if !domainMatch(qName, spec.domains) {
+					continue
+				}
+				set := spec.config
+				if (is4 && set.family == "ip6") || (!is4 && set.family == "ip") {
+					continue
+				}
+				if set.v4Only && !is4 || set.v6Only && is4 {
+					continue
+				}
+				key := nftSetKey{set.family, set.table, set.setName}
+				var elemKey []byte
+				if is4 {
+					elemKey = ip.To4()
+				} else {
+					elemKey = ip.To16()
+				}
+				batches[key] = append(batches[key], elemKey)
 			}
 		}
+		nftAddElements(batches, qName, id)
 	}
 }

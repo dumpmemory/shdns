@@ -417,8 +417,11 @@ func reloadConfig() {
 		return
 	}
 
-	if len(ipsetSpecs) > 0 && ipsetSock < 0 {
+	if len(ipsetSpecs) > 0 {
 		ipsetInit()
+	}
+	if len(nftSetSpecs) > 0 {
+		nftInit()
 	}
 	logger.Print("Configuration reloaded successfully")
 }

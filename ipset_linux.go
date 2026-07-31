@@ -5,13 +5,16 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
+	"sync"
 	"syscall"
-	"unsafe"
+
+	"github.com/mdlayher/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	ipset_CMD_ADD          = 9
 	ipset_PROTOCOL         = 6
 	ipset_ATTR_PROTOCOL    = 1
 	ipset_ATTR_SETNAME     = 2
@@ -19,150 +22,119 @@ const (
 	ipset_ATTR_IP          = 1
 	ipset_ATTR_IPADDR_IPV4 = 1
 	ipset_ATTR_IPADDR_IPV6 = 2
+	ipset_CMD_ADD          = 9
 	ipset_MAXNAMELEN       = 32
-	nfNETLINK_V0           = 0
 	nfNL_SUBSYS_IPSET      = 6
-	nla_F_NESTED           = 1 << 15
-	nla_F_NET_BYTEORDER    = 1 << 14
-	nlm_F_REQUEST          = 0x0001
-	nlm_F_ACK              = 0x0004
 )
 
-type nfgenmsg struct {
-	Family  uint8
-	Version uint8
-	ResId   uint16
-}
-
-var ipsetSock int = -1
-
-func nlAlign(len int) int {
-	return (len + 3) & ^3
-}
+var (
+	ipsetConn   *netlink.Conn
+	ipsetConnMu sync.Mutex
+)
 
 func ipsetInit() {
-	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_NETFILTER)
+	ipsetConnMu.Lock()
+	defer ipsetConnMu.Unlock()
+	if ipsetConn != nil {
+		return
+	}
+	conn, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
 	if err != nil {
-		errlog.Fatalf("ipset Netlink socket: %v", err)
+		errlog.Fatalf("ipset netlink: %v", err)
 	}
-	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
-	if err := syscall.Bind(fd, sa); err != nil {
-		syscall.Close(fd)
-		errlog.Fatalf("ipset Netlink bind: %v", err)
-	}
-	ipsetSock = fd
+	ipsetConn = conn
 }
 
 func ipsetClose() {
-	if ipsetSock >= 0 {
-		syscall.Close(ipsetSock)
-		ipsetSock = -1
+	ipsetConnMu.Lock()
+	defer ipsetConnMu.Unlock()
+	if ipsetConn != nil {
+		ipsetConn.Close()
+		ipsetConn = nil
 	}
 }
 
-func ipsetAddToSet(name string, ip net.IP) error {
+func ipsetAddElements(name string, ips []net.IP, qName string, id uint16) {
 	if len(name) >= ipset_MAXNAMELEN {
-		return syscall.ENAMETOOLONG
+		errlog.Printf("ipset add %s: name too long", name)
+		return
 	}
+	for _, ip := range ips {
+		is4 := ip.To4() != nil
+		var af int
+		var ipAttrType uint16
+		var addr []byte
+		if is4 {
+			af = syscall.AF_INET
+			ipAttrType = ipset_ATTR_IPADDR_IPV4
+			addr = ip.To4()
+		} else {
+			af = syscall.AF_INET6
+			ipAttrType = ipset_ATTR_IPADDR_IPV6
+			addr = ip.To16()
+		}
 
-	is4 := ip.To4() != nil
-	var af, addrsz int
-	var ipAttrType uint16
-	if is4 {
-		af = syscall.AF_INET
-		addrsz = net.IPv4len
-		ipAttrType = ipset_ATTR_IPADDR_IPV4 | nla_F_NET_BYTEORDER
-	} else {
-		af = syscall.AF_INET6
-		addrsz = net.IPv6len
-		ipAttrType = ipset_ATTR_IPADDR_IPV6 | nla_F_NET_BYTEORDER
-	}
+		msg := netlink.Message{
+			Header: netlink.Header{
+				Type:  netlink.HeaderType((nfNL_SUBSYS_IPSET << 8) | ipset_CMD_ADD),
+				Flags: netlink.Request | netlink.Acknowledge,
+			},
+			Data: buildIpsetAdd(af, name, ipAttrType, addr),
+		}
 
-	buf := make([]byte, 256)
-	nlhLen := int(unsafe.Sizeof(syscall.NlMsghdr{}))
-	nfgLen := int(unsafe.Sizeof(nfgenmsg{}))
-
-	// nlmsghdr
-	nlh := (*syscall.NlMsghdr)(unsafe.Pointer(&buf[0]))
-	nlh.Len = uint32(nlhLen)
-	nlh.Type = uint16(ipset_CMD_ADD | (nfNL_SUBSYS_IPSET << 8))
-	nlh.Flags = nlm_F_REQUEST | nlm_F_ACK
-	nlh.Seq = 1
-	nlh.Pid = 0
-
-	// nfgenmsg
-	off := nlAlign(int(nlh.Len))
-	nfg := (*nfgenmsg)(unsafe.Pointer(&buf[off]))
-	nfg.Family = uint8(af)
-	nfg.Version = nfNETLINK_V0
-	nfg.ResId = 0
-	nlh.Len = uint32(off + nfgLen)
-
-	// IPSET_ATTR_PROTOCOL
-	off = nlAlign(int(nlh.Len))
-	binary.LittleEndian.PutUint16(buf[off:], 4+1)
-	binary.LittleEndian.PutUint16(buf[off+2:], ipset_ATTR_PROTOCOL)
-	buf[off+4] = ipset_PROTOCOL
-	nlh.Len = uint32(off + nlAlign(5))
-
-	// IPSET_ATTR_SETNAME
-	off = nlAlign(int(nlh.Len))
-	nameBytes := append([]byte(name), 0)
-	nlaLen := 4 + len(nameBytes)
-	binary.LittleEndian.PutUint16(buf[off:], uint16(nlaLen))
-	binary.LittleEndian.PutUint16(buf[off+2:], ipset_ATTR_SETNAME)
-	copy(buf[off+4:], nameBytes)
-	nlh.Len = uint32(off + nlAlign(nlaLen))
-
-	// Nested IPSET_ATTR_DATA
-	dataNlaOff := nlAlign(int(nlh.Len))
-	nlh.Len = uint32(dataNlaOff + nlAlign(4))
-
-	// Nested IPSET_ATTR_IP
-	ipNlaOff := nlAlign(int(nlh.Len))
-	nlh.Len = uint32(ipNlaOff + nlAlign(4))
-
-	// IP address attribute
-	off = nlAlign(int(nlh.Len))
-	ipNlaLen := 4 + addrsz
-	binary.LittleEndian.PutUint16(buf[off:], uint16(ipNlaLen))
-	binary.LittleEndian.PutUint16(buf[off+2:], ipAttrType)
-	if is4 {
-		copy(buf[off+4:], ip.To4())
-	} else {
-		copy(buf[off+4:], ip.To16())
-	}
-	nlh.Len = uint32(off + nlAlign(ipNlaLen))
-
-	// Patch nested lengths
-	total := int(nlh.Len)
-	binary.LittleEndian.PutUint16(buf[ipNlaOff:], uint16(total-ipNlaOff))
-	binary.LittleEndian.PutUint16(buf[ipNlaOff+2:], nla_F_NESTED|ipset_ATTR_IP)
-	binary.LittleEndian.PutUint16(buf[dataNlaOff:], uint16(total-dataNlaOff))
-	binary.LittleEndian.PutUint16(buf[dataNlaOff+2:], nla_F_NESTED|ipset_ATTR_DATA)
-
-	sa := &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}
-	if err := syscall.Sendto(ipsetSock, buf[:nlh.Len], 0, sa); err != nil {
-		return err
-	}
-
-	// Read response
-	resp := make([]byte, 256)
-	n, _, err := syscall.Recvfrom(ipsetSock, resp, 0)
-	if err != nil {
-		return err
-	}
-
-	errLen := int(unsafe.Sizeof(syscall.NlMsgerr{}))
-	if n >= nlhLen {
-		rnlh := (*syscall.NlMsghdr)(unsafe.Pointer(&resp[0]))
-		if rnlh.Type == syscall.NLMSG_ERROR && n >= errLen {
-			nlerr := (*syscall.NlMsgerr)(unsafe.Pointer(&resp[nlhLen]))
-			if nlerr.Error != 0 {
-				return syscall.Errno(-nlerr.Error)
+		_, err := ipsetConn.Execute(msg)
+		if err != nil {
+			if errors.Is(err, unix.EINVAL) {
+				continue
 			}
+			errlog.Printf("ipset add %s %s: %v", name, ip, err)
+			continue
+		}
+		if *verbose {
+			logger.Printf("%d ipset %s <- %s (%s)", id, name, ip, qName)
 		}
 	}
+}
 
-	return nil
+func buildIpsetAdd(af int, setName string, ipAttrType uint16, addr []byte) []byte {
+	// nfgenmsg
+	nfg := []byte{byte(af), 0, 0, 0}
+
+	// IPSET_ATTR_PROTOCOL
+	proto := nlattr(ipset_ATTR_PROTOCOL, []byte{ipset_PROTOCOL})
+
+	// IPSET_ATTR_SETNAME
+	nameBytes := append([]byte(setName), 0)
+	sname := nlattr(ipset_ATTR_SETNAME, nameBytes)
+
+	// IPSET_ATTR_IP (nested)
+	ipAddr := nlattr(ipAttrType|unix.NLA_F_NET_BYTEORDER, addr)
+	ipNest := nlattr(ipset_ATTR_IP|unix.NLA_F_NESTED, ipAddr)
+
+	// IPSET_ATTR_DATA (nested)
+	data := nlattr(ipset_ATTR_DATA|unix.NLA_F_NESTED, ipNest)
+
+	// Concatenate: nfgenmsg + aligned(proto) + aligned(sname) + aligned(data)
+	total := len(nfg) + nlAlign(len(proto)) + nlAlign(len(sname)) + nlAlign(len(data))
+	buf := make([]byte, total)
+	off := copy(buf, nfg)
+	off += copy(buf[off:], proto)
+	off += copy(buf[off:], make([]byte, nlAlign(off)-off))
+	off += copy(buf[off:], sname)
+	off += copy(buf[off:], make([]byte, nlAlign(off)-off))
+	off += copy(buf[off:], data)
+	return buf[:off]
+}
+
+func nlattr(typ uint16, data []byte) []byte {
+	l := uint16(4 + len(data))
+	buf := make([]byte, nlAlign(int(l)))
+	binary.LittleEndian.PutUint16(buf[0:], l)
+	binary.LittleEndian.PutUint16(buf[2:], typ)
+	copy(buf[4:], data)
+	return buf
+}
+
+func nlAlign(n int) int {
+	return (n + 3) & ^3
 }
