@@ -20,15 +20,18 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"shdns/dnsmessage"
@@ -51,8 +54,28 @@ var reversenet = flag.String("r", "", "Address and port for listening to reverse
 var cachelife = flag.Int("c", 60, "DNS cache lifetime (minutes) for reverse lookup")
 var verbose = flag.Bool("v", false, "Verbose mode. Connection will remain open after replied until timeout.")
 var showver = flag.Bool("V", false, "Show version")
+var conffile = flag.String("C", "", "Configuration file (dnsmasq-style)")
 var version = "unknown"
 var builddate = "unknown"
+
+var configNameMap = map[string]string{
+	"bind":                "b",
+	"nameserver-domestic": "d",
+	"nameserver-foreign":  "f",
+	"trustworthy":         "t",
+	"fast":                "F",
+	"list-domestic-ipv4":  "l4",
+	"list-domestic-ipv6":  "l6",
+	"blacklist-ipv4":      "k4",
+	"blacklist-ipv6":      "k6",
+	"min-rtt":             "m",
+	"safe-rtt":            "s",
+	"wait-domestic":       "w",
+	"timeout":             "M",
+	"reverse-listen":      "r",
+	"cache-life":          "c",
+	"verbose":             "v",
+}
 
 type serverType int
 
@@ -101,6 +124,7 @@ var (
 	cnIPNet4, cnIPNet6   []net.IPNet
 	blackIPs4, blackIPs6 []net.IPNet
 	servers              []nameserver
+	serversMu            sync.RWMutex
 	reverseTable         cache
 	logger               = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 	errlog               = log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lmicroseconds)
@@ -121,38 +145,57 @@ func parseUDPAddr(str string) (*net.UDPAddr, error) {
 }
 
 func parseServers(str string, sType serverType) {
-	serverstr := strings.Split(str, ",")
-	for _, s := range serverstr {
-		if addr, err := parseUDPAddr(s); err != nil {
-			errlog.Fatalf("Invalid nameserver: %s", s)
-		} else {
-			if addr.Zone != "" {
-				if zoneid, err := strconv.Atoi(addr.Zone); err == nil {
-					if ifi, err := net.InterfaceByIndex(zoneid); err == nil {
-						addr.Zone = ifi.Name
-					} else {
-						errlog.Fatalf("IPv6 zone invalid: %s", s)
-					}
-				} else if _, err := net.InterfaceByName(addr.Zone); err != nil {
-					errlog.Fatalf("IPv6 zone invalid: %s", s)
-				}
-			}
-			if _, exist := lookupServer(addr); !exist {
-				servers = append(servers, nameserver{udpAddr: addr, sType: sType})
-				logger.Printf("Using nameserver %s", addr)
-			} else {
-				errlog.Fatalf("Nameserver exists: %s", s)
-			}
-		}
+	if err := parseServersE(str, sType, &servers); err != nil {
+		errlog.Fatalf("Invalid nameserver: %v", err)
 	}
 }
 
+func parseServersE(str string, sType serverType, dest *[]nameserver) error {
+	serverstr := strings.Split(str, ",")
+	for _, s := range serverstr {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		addr, err := parseUDPAddr(s)
+		if err != nil {
+			return fmt.Errorf("%s: %v", s, err)
+		}
+		if addr.Zone != "" {
+			if zoneid, err := strconv.Atoi(addr.Zone); err == nil {
+				if ifi, err := net.InterfaceByIndex(zoneid); err == nil {
+					addr.Zone = ifi.Name
+				} else {
+					return fmt.Errorf("IPv6 zone invalid: %s", s)
+				}
+			} else if _, err := net.InterfaceByName(addr.Zone); err != nil {
+				return fmt.Errorf("IPv6 zone invalid: %s", s)
+			}
+		}
+		if _, exist := lookupServerIn(addr, *dest); exist {
+			return fmt.Errorf("Nameserver exists: %s", s)
+		}
+		*dest = append(*dest, nameserver{udpAddr: addr, sType: sType})
+		logger.Printf("Using nameserver %s", addr)
+	}
+	return nil
+}
+
 func parseIPList(filename string, iplen int) (ipnets []net.IPNet) {
-	f, err := os.Open(filename)
+	ipnets, err := parseIPListE(filename, iplen)
 	if err != nil {
 		errlog.Fatalln(err)
 	}
+	return ipnets
+}
+
+func parseIPListE(filename string, iplen int) ([]net.IPNet, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
 	defer f.Close()
+	var ipnets []net.IPNet
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		ipstr := scanner.Text()
@@ -163,18 +206,19 @@ func parseIPList(filename string, iplen int) (ipnets []net.IPNet) {
 				ipstr += "/32"
 			}
 		}
-		// ParseCIDR returns 16-byte net.IP and 4 or 16-byte net.IPNet (both IP and Mask)
-		if _, ipnet, err := net.ParseCIDR(ipstr); err != nil {
-			errlog.Fatalf("Invalid IP/CIDR: %s in file %s", scanner.Text(), filename)
-		} else if len(ipnet.IP) == iplen {
+		_, ipnet, err := net.ParseCIDR(ipstr)
+		if err != nil {
+			return nil, fmt.Errorf("Invalid IP/CIDR: %s in file %s", scanner.Text(), filename)
+		}
+		if len(ipnet.IP) == iplen {
 			ipnets = append(ipnets, *ipnet)
 		} else if iplen == net.IPv4len {
-			errlog.Fatalf("IPv4 address needed: %s in file %s", scanner.Text(), filename)
+			return nil, fmt.Errorf("IPv4 address needed: %s in file %s", scanner.Text(), filename)
 		} else {
-			errlog.Fatalf("IPv6 address needed: %s in file %s", scanner.Text(), filename)
+			return nil, fmt.Errorf("IPv6 address needed: %s in file %s", scanner.Text(), filename)
 		}
 	}
-	return
+	return ipnets, nil
 }
 
 func cmpIPIPNet(ip net.IP, ipnet net.IPNet) int { // based on net.Contains()
@@ -412,15 +456,23 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 func forwardQueryAndReply(payload []byte, outConn *net.UDPConn, chAnswer chan<- answer, chSave, chFail chan<- []byte, qType dnsmessage.Type, qName string, hasOPT, dnssec bool) {
 	defer close(chAnswer)
 	sentTime := time.Now()
+	serversMu.RLock()
 	for _, ns := range servers {
 		outConn.WriteToUDP(payload, ns.udpAddr)
 	}
+	serversMu.RUnlock()
 	outConn.SetReadDeadline(sentTime.Add(time.Duration(*timeout) * time.Millisecond))
 	parseAnswers(outConn, sentTime, chAnswer, chSave, chFail, qType, qName, hasOPT, dnssec)
 }
 
 func lookupServer(addr *net.UDPAddr) (nameserver, bool) {
-	for _, s := range servers {
+	serversMu.RLock()
+	defer serversMu.RUnlock()
+	return lookupServerIn(addr, servers)
+}
+
+func lookupServerIn(addr *net.UDPAddr, list []nameserver) (nameserver, bool) {
+	for _, s := range list {
 		if s.udpAddr.IP.Equal(addr.IP) && s.udpAddr.Port == addr.Port && s.udpAddr.Zone == addr.Zone {
 			return s, true
 		}
@@ -820,53 +872,255 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 	}
 }
 
-func main() {
-	flag.Parse()
-	if flag.NArg() > 0 || len(os.Args) == 1 {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-		os.Exit(1)
+func parseConfig(filename string) (map[string]string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
 	}
-	if *showver {
-		fmt.Printf("shdns version %s (built %s)\n", version, builddate)
-		return
+	defer f.Close()
+	cfg := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	lineno := 0
+	for scanner.Scan() {
+		lineno++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key := line
+		val := ""
+		if i := strings.IndexByte(line, '='); i >= 0 {
+			key = strings.TrimSpace(line[:i])
+			val = strings.TrimSpace(line[i+1:])
+		}
+		if key == "" {
+			return nil, fmt.Errorf("config line %d: empty key", lineno)
+		}
+		if _, exists := configNameMap[key]; !exists {
+			return nil, fmt.Errorf("config line %d: unknown option %q", lineno, key)
+		}
+		if _, dup := cfg[key]; dup {
+			return nil, fmt.Errorf("config line %d: duplicate option %q", lineno, key)
+		}
+		cfg[key] = val
 	}
-	if *ipnet4file != "" {
-		cnIPNet4 = parseIPList(*ipnet4file, net.IPv4len)
-		if cnIPNet4 != nil {
-			logger.Printf("Loaded %d domestic IPv4 entries", len(cnIPNet4))
-			sort.Sort(byByte(cnIPNet4))
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func applyConfig(cfg map[string]string, cliSet map[string]bool) error {
+	for name, val := range cfg {
+		flagName, ok := configNameMap[name]
+		if !ok {
+			return fmt.Errorf("unknown option: %s", name)
+		}
+		if cliSet[flagName] {
+			continue
+		}
+		switch flagName {
+		case "b":
+			*localnet = val
+		case "d":
+			*dservers = val
+		case "f":
+			*fservers = val
+		case "t":
+			if val == "" || val == "true" {
+				*trusted = true
+			} else if val != "false" {
+				return fmt.Errorf("invalid bool for %s: %s", name, val)
+			}
+		case "F":
+			if val == "" || val == "true" {
+				*fast = true
+			} else if val != "false" {
+				return fmt.Errorf("invalid bool for %s: %s", name, val)
+			}
+		case "l4":
+			*ipnet4file = val
+		case "l6":
+			*ipnet6file = val
+		case "k4":
+			*blacklist4file = val
+		case "k6":
+			*blacklist6file = val
+		case "v":
+			if val == "" || val == "true" {
+				*verbose = true
+			} else if val != "false" {
+				return fmt.Errorf("invalid bool for %s: %s", name, val)
+			}
+		case "m":
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid int for %s: %s", name, val)
+			}
+			*minrtt = n
+		case "s":
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid int for %s: %s", name, val)
+			}
+			*minsafe = n
+		case "w":
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid int for %s: %s", name, val)
+			}
+			*minwait = n
+		case "M":
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid int for %s: %s", name, val)
+			}
+			*timeout = n
+		case "r":
+			*reversenet = val
+		case "c":
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("invalid int for %s: %s", name, val)
+			}
+			*cachelife = n
 		}
 	}
-	if cnIPNet4 == nil {
-		errlog.Fatalln("Domestic IPv4 list must be provided")
+	return nil
+}
+
+func loadConfig() error {
+	// Load IPv4 domestic list
+	if *ipnet4file == "" {
+		return errors.New("Domestic IPv4 list must be provided")
 	}
+	newIPNet4, err := parseIPListE(*ipnet4file, net.IPv4len)
+	if err != nil {
+		return err
+	}
+	sort.Sort(byByte(newIPNet4))
+	logger.Printf("Loaded %d domestic IPv4 entries", len(newIPNet4))
+
+	// Load IPv6 domestic list
+	var newIPNet6 []net.IPNet
 	if *ipnet6file != "" {
-		cnIPNet6 = parseIPList(*ipnet6file, net.IPv6len)
-		if cnIPNet6 != nil {
-			logger.Printf("Loaded %d domestic IPv6 entries", len(cnIPNet6))
-			sort.Sort(byByte(cnIPNet6))
+		newIPNet6, err = parseIPListE(*ipnet6file, net.IPv6len)
+		if err != nil {
+			return err
 		}
+		sort.Sort(byByte(newIPNet6))
+		logger.Printf("Loaded %d domestic IPv6 entries", len(newIPNet6))
 	}
+
+	// Load blacklists
+	var newBlack4, newBlack6 []net.IPNet
 	if *blacklist4file != "" {
-		blackIPs4 = parseIPList(*blacklist4file, net.IPv4len)
-		if blackIPs4 != nil {
-			logger.Printf("Loaded %d blacklisted IPv4 entries", len(blackIPs4))
+		newBlack4, err = parseIPListE(*blacklist4file, net.IPv4len)
+		if err != nil {
+			return err
 		}
+		logger.Printf("Loaded %d blacklisted IPv4 entries", len(newBlack4))
 	}
 	if *blacklist6file != "" {
-		blackIPs6 = parseIPList(*blacklist6file, net.IPv6len)
-		if blackIPs6 != nil {
-			logger.Printf("Loaded %d blacklisted IPv6 entries", len(blackIPs6))
+		newBlack6, err = parseIPListE(*blacklist6file, net.IPv6len)
+		if err != nil {
+			return err
 		}
+		logger.Printf("Loaded %d blacklisted IPv6 entries", len(newBlack6))
 	}
-	parseServers(*dservers, domestic)
-	parseServers(*fservers, foreign)
+
+	// Parse nameservers
+	var newServers []nameserver
+	if err := parseServersE(*dservers, domestic, &newServers); err != nil {
+		return err
+	}
+	if err := parseServersE(*fservers, foreign, &newServers); err != nil {
+		return err
+	}
+
+	// Apply trustworthy mode
 	if *trusted {
 		logger.Print("Foreign servers in trustworthy mode")
 		*minsafe = 0
 		*minrtt = 0
 	}
+
+	// Atomically swap global state
+	cnIPNet4 = newIPNet4
+	cnIPNet6 = newIPNet6
+	blackIPs4 = newBlack4
+	blackIPs6 = newBlack6
+	serversMu.Lock()
+	servers = newServers
+	serversMu.Unlock()
+
+	return nil
+}
+
+func reloadConfig() {
+	if *conffile == "" {
+		logger.Print("SIGHUP received but no config file specified (-C), ignoring")
+		return
+	}
+	cfg, err := parseConfig(*conffile)
+	if err != nil {
+		errlog.Printf("Config reload failed: %v", err)
+		return
+	}
+	// Skip bind and reverse-listen (cannot be changed at runtime)
+	skipSet := map[string]bool{"b": true, "r": true}
+	if err := applyConfig(cfg, skipSet); err != nil {
+		errlog.Printf("Config reload failed: %v", err)
+		return
+	}
+
+	if err := loadConfig(); err != nil {
+		errlog.Printf("Config reload failed: %v", err)
+		return
+	}
+	logger.Print("Configuration reloaded successfully")
+}
+
+func main() {
+	flag.Parse()
+	if *showver {
+		fmt.Printf("shdns version %s (built %s)\n", version, builddate)
+		return
+	}
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	// Build set of explicitly provided CLI flags
+	cliSet := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		cliSet[f.Name] = true
+	})
+
+	// Load config file if specified
+	if *conffile != "" {
+		cfg, err := parseConfig(*conffile)
+		if err != nil {
+			errlog.Fatalf("Config file error: %v", err)
+		}
+		if err := applyConfig(cfg, cliSet); err != nil {
+			errlog.Fatalf("Config file error: %v", err)
+		}
+	}
+
+	// Ensure at least one way to provide config exists
+	if len(os.Args) == 1 && *conffile == "" {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	if err := loadConfig(); err != nil {
+		errlog.Fatalln(err)
+	}
+
 	addr, err := parseUDPAddr(*localnet)
 	if err != nil {
 		errlog.Fatalf("Invalid binding address: %s", *localnet)
@@ -892,6 +1146,17 @@ func main() {
 			}
 		}
 	}
+
+	// Handle SIGHUP for config reload
+	sigHup := make(chan os.Signal, 1)
+	signal.Notify(sigHup, syscall.SIGHUP)
+	go func() {
+		for range sigHup {
+			logger.Print("Received SIGHUP, reloading configuration...")
+			reloadConfig()
+		}
+	}()
+
 	for {
 		var payload [1500]byte
 		if n, addr, err := inConn.ReadFromUDP(payload[:]); err != nil {

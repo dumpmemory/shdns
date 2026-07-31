@@ -73,6 +73,8 @@ I very much appreciate the simple idea behind ChinaDNS and believe many function
 
 Parameters
 ----
+    -C string
+          Configuration file (dnsmasq-style)
     -F    Fast mode. Accept foreign IP from domestic nameservers if it passes basic checks.
     -M int
           DNS query timeout (ms). Use a larger value for high-latency network or DNS-over-HTTPS. (default 3000)
@@ -100,15 +102,90 @@ Parameters
     -w int
           Time (ms) during which domestic answers are prioritized. Usually used with a local caching resolver. (default 100)
 
+Configuration file
+----
+
+shdns supports a dnsmasq-style configuration file specified with `-C`. Each line contains one option in the format `name=value` (for strings and integers) or just `name` (for boolean flags). Lines starting with `#` are comments.
+
+CLI flags take precedence over config file values. If no `-C` is specified, shdns works in pure CLI mode as before.
+
+    # shdns configuration file
+    bind=localhost:5353
+    nameserver-domestic=114.114.114.114,223.5.5.5
+    nameserver-foreign=8.8.8.8,8.8.4.4
+    list-domestic-ipv4=/etc/shdns/cnipv4.txt
+    list-domestic-ipv6=/etc/shdns/cnipv6.txt
+    blacklist-ipv4=/etc/shdns/blacklist4.txt
+    blacklist-ipv6=/etc/shdns/blacklist6.txt
+    trustworthy
+    fast
+    verbose
+    min-rtt=30
+    safe-rtt=100
+    wait-domestic=100
+    timeout=3000
+    reverse-listen=127.0.0.1:5354
+    cache-life=60
+
+Available option names:
+
+| Config name | CLI flag | Type |
+|---|---|---|
+| `bind` | `-b` | string |
+| `nameserver-domestic` | `-d` | string |
+| `nameserver-foreign` | `-f` | string |
+| `trustworthy` | `-t` | bool |
+| `fast` | `-F` | bool |
+| `list-domestic-ipv4` | `-l4` | string |
+| `list-domestic-ipv6` | `-l6` | string |
+| `blacklist-ipv4` | `-k4` | string |
+| `blacklist-ipv6` | `-k6` | string |
+| `min-rtt` | `-m` | int |
+| `safe-rtt` | `-s` | int |
+| `wait-domestic` | `-w` | int |
+| `timeout` | `-M` | int |
+| `reverse-listen` | `-r` | string |
+| `cache-life` | `-c` | int |
+| `verbose` | `-v` | bool |
+
+Hot reload
+----
+
+shdns supports reloading configuration without restarting by sending SIGHUP:
+
+    kill -HUP $(pidof shdns)
+
+On SIGHUP, shdns re-reads the configuration file (if `-C` was used) and reloads all IP list files and nameserver settings. The bind address (`-b`) and reverse DNS listener (`-r`) cannot be changed at runtime and are skipped.
+
+If the config file has errors on reload, the old configuration is kept and an error is logged.
+
+If no config file was specified, SIGHUP is ignored with a warning.
+
 Usage examples
 ----
 
-* Scenario 1: Home broadband
+* Scenario 1: Home broadband (CLI mode)
 
       shdns -b 127.0.0.1:5353 -l4 cnipv4.txt -l6 cnipv6.txt -m 30 -M 1000 -s 100
-    This scenario has no trustworthy servers and users are HIGHLY RECOMMENDED to tweak the parameters by analyzing the verbose output. 
+
+* Scenario 1b: Home broadband (config file mode)
+
+      shdns -C /etc/shdns.conf
+
+  Example `/etc/shdns.conf`:
+
+      bind=127.0.0.1:5353
+      list-domestic-ipv4=cnipv4.txt
+      list-domestic-ipv6=cnipv6.txt
+      nameserver-domestic=114.114.114.114,223.5.5.5
+      nameserver-foreign=8.8.8.8,1.1.1.1
+      min-rtt=30
+      timeout=1000
+      safe-rtt=100
+
+  This scenario has no trustworthy servers and users are HIGHLY RECOMMENDED to tweak the parameters by analyzing the verbose output. 
     
-    **Do not use the parameters as is!**
+  **Do not use the parameters as is!**
 
     Hint: For those users who want to replicate ChinaDNS's behavior (no minimum RTT and safe RTT checks, always wait until the end of the delay), set `-m` to `0`, `-s` equal to the delay (i.e. `-y` in ChinaDNS, default is 300).
 
