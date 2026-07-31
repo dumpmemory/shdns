@@ -126,6 +126,8 @@ CLI flags take precedence over config file values. If no `-C` is specified, shdn
     timeout=3000
     reverse-listen=127.0.0.1:5354
     cache-life=60
+    ipset=/<google.com>/<youtube.com>/gfwlist
+    nftset=/<google.com>/inet#fw4#gfwlist
 
 Available option names:
 
@@ -147,6 +149,8 @@ Available option names:
 | `reverse-listen` | `-r` | string |
 | `cache-life` | `-c` | int |
 | `verbose` | `-v` | bool |
+| `ipset` | — | string (repeatable) |
+| `nftset` | — | string (repeatable) |
 
 Hot reload
 ----
@@ -160,6 +164,65 @@ On SIGHUP, shdns re-reads the configuration file (if `-C` was used) and reloads 
 If the config file has errors on reload, the old configuration is kept and an error is logged.
 
 If no config file was specified, SIGHUP is ignored with a warning.
+
+IP set integration (ipset / nftables)
+----
+
+shdns can add resolved IP addresses to Linux ipset or nftables sets, similar to dnsmasq's `--ipset` and `--nftset` options. This is useful for policy routing (e.g. routing foreign IPs through a VPN).
+
+Only IPs from answers actually returned to the client are added. IPs are added to the set **before** the DNS response is sent to the client, ensuring firewall rules are in place when the client connects.
+
+IP set options are config-file only and can be specified multiple times. Domain filtering uses dnsmasq-style suffix matching.
+
+### Domain matching
+
+The syntax follows dnsmasq's format:
+
+    ipset=/<domain1>/<domain2>/SETNAME
+    nftset=/<domain1>/[4#|6#][family#]table#set
+
+Domains are suffix-matched against the queried name. For example, `/google.com/` matches `www.google.com`, `mail.google.com`, etc. If no domains are specified, all queries' IPs are added to the set.
+
+### ipset
+
+    # Only add IPs from google.com and youtube.com to gfwlist
+    ipset=/<google.com>/<youtube.com>/gfwlist
+
+    # Add all resolved IPs to myset
+    ipset=myset
+
+    # Multiple ipset entries (config file allows repeated keys)
+    ipset=/<google.com>/<youtube.com>/gfwlist
+    ipset=/<facebook.com>/socialset
+
+The ipset must already exist (create with `ipset create gfwlist hash:net`).
+
+### nftables
+
+The nftset format follows dnsmasq's syntax: `[4#|6#][family#]table#set`
+
+| Spec | Meaning |
+|---|---|
+| `inet#fw4#gfwlist` | All IPs, inet family |
+| `fw4#gfwlist` | Same (family defaults to `inet`) |
+| `4#inet#fw4#gfwlist` | IPv4 only |
+| `6#ip6#fw4#ipv6set` | IPv6 only, ip6 family |
+
+    # Only add IPs from google.com to nftables set
+    nftset=/<google.com>/inet#fw4#gfwlist
+
+    # IPv4 only, with domain filter
+    nftset=/<youtube.com>/4#inet#fw4#yt4
+
+    # Multiple nftset entries
+    nftset=/<google.com>/inet#fw4#gfwlist
+    nftset=/<youtube.com>/4#inet#fw4#yt4
+
+The nftables set must already exist (create with `nft add set inet fw4 gfwlist { type ipv4_addr \; }`).
+
+### Hot reload
+
+ipset and nftset configurations are reloaded on SIGHUP along with other settings.
 
 Usage examples
 ----
@@ -245,6 +308,30 @@ Usage examples
 
       shdns -b 127.0.0.1:5353 -l4 cnipv4.txt -l6 cnipv6.txt -M 3000 -w 50 -t -f 127.0.0.1:5300
     This is very similar to scenario 2. The only difference is that here a local caching server is set as the foreign server. A large value is used for timeout due to the time-consuming TLS handshake and `-w` is critical to be domestic CDN-friendly.
+
+* Scenario 4: Policy routing with ipset / nftables
+
+      # Create ipset
+      ipset create gfwlist hash:net
+
+      # Start shdns with ipset (via config file)
+      shdns -b 127.0.0.1:5353 -l4 cnipv4.txt -l6 cnipv6.txt -C /etc/shdns.conf
+
+  Example `/etc/shdns.conf` for ipset with domain filtering:
+
+      ipset=/<google.com>/<youtube.com>/<twitter.com>/gfwlist
+
+  Route ipset traffic via VPN (example with iptables):
+
+      iptables -t mangle -A PREROUTING -m set --match-set gfwlist dst -j MARK --set-mark 1
+
+  This also works with nftables:
+
+      nft add set inet fw4 gfwlist { type ipv4_addr \; }
+
+  Example `/etc/shdns.conf` for nftset:
+
+      nftset=/<google.com>/<youtube.com>/inet#fw4#gfwlist
 
 Message truncation
 ----

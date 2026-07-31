@@ -26,7 +26,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,6 +77,8 @@ var configNameMap = map[string]string{
 	"reverse-listen":      "r",
 	"cache-life":          "c",
 	"verbose":             "v",
+	"ipset":               "",
+	"nftset":              "",
 }
 
 type serverType int
@@ -92,6 +96,7 @@ type nameserver struct {
 type answer struct {
 	payload []byte
 	sType   serverType
+	ips     []net.IP
 }
 
 type cacheEntry struct {
@@ -124,11 +129,74 @@ var (
 	cnIPNet4, cnIPNet6   []net.IPNet
 	blackIPs4, blackIPs6 []net.IPNet
 	servers              []nameserver
-	serversMu            sync.RWMutex
 	reverseTable         cache
 	logger               = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
 	errlog               = log.New(os.Stderr, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+	ipsetSpecs           []ipsetSpec
+	nftSetSpecs          []nftSetSpec
+	parsedIPSetSpecs     []ipsetSpec
+	parsedNFTSetSpecs    []nftSetSpec
 )
+
+type nftSetConfig struct {
+	family  string // ip, ip6, inet (default inet)
+	table   string
+	setName string
+	v4Only  bool // only add IPv4 addresses (4# prefix)
+	v6Only  bool // only add IPv6 addresses (6# prefix)
+}
+
+type ipsetSpec struct {
+	domains []string // empty = match all
+	setName string
+}
+
+type nftSetSpec struct {
+	domains []string
+	config  nftSetConfig
+}
+
+func parseSetDomains(spec string) (domains []string, names []string) {
+	if !strings.HasPrefix(spec, "/") {
+		for _, n := range strings.Split(spec, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+		return nil, names
+	}
+	parts := strings.Split(spec, "/")
+	// /<d1>/<d2>/name1,name2 -> ["", "d1", "d2", "name1,name2"]
+	if len(parts) < 3 || parts[len(parts)-1] == "" {
+		return nil, strings.Split(spec, ",")
+	}
+	for _, n := range strings.Split(parts[len(parts)-1], ",") {
+		n = strings.TrimSpace(n)
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	for _, p := range parts[1 : len(parts)-1] {
+		if p != "" {
+			domains = append(domains, p)
+		}
+	}
+	return
+}
+
+func domainMatch(qName string, domains []string) bool {
+	if len(domains) == 0 {
+		return true
+	}
+	name := strings.TrimSuffix(qName, ".")
+	for _, d := range domains {
+		if name == d || strings.HasSuffix(name, "."+d) {
+			return true
+		}
+	}
+	return false
+}
 
 func parseUDPAddr(str string) (*net.UDPAddr, error) {
 	_, _, err := net.SplitHostPort(str)
@@ -370,7 +438,7 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 		}
 	}
 	chAnswer := make(chan answer)
-	chSave := make(chan []byte)
+	chSave := make(chan answer)
 	chFail := make(chan []byte)
 	loc, _ := net.ResolveUDPAddr("udp", "")
 	outConn, err := net.ListenUDP("udp", loc)
@@ -380,9 +448,11 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 	}
 	defer outConn.Close()
 	go forwardQueryAndReply(payload, outConn, chAnswer, chSave, chFail, qs[0].Type, qs[0].Name.String(), hasOPT, dnssec)
+	qName := qs[0].Name.String()
 	answered := false
 	waiting := true
-	var savedAnswer, waitedAnswer, failedAnswer []byte
+	var savedAnswer, waitedAnswer answer
+	var failedAnswer []byte
 	timerSafe := time.NewTimer(time.Duration(*minsafe) * time.Millisecond)
 	timerWait := time.NewTimer(time.Duration(*minwait) * time.Millisecond)
 	for {
@@ -392,20 +462,22 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 				if !answered {
 					if a.sType == domestic && a.payload == nil {
 						waiting = false
-						if waitedAnswer != nil {
-							if _, err := inConn.WriteToUDP(waitedAnswer, addr); err != nil {
+						if waitedAnswer.payload != nil {
+							addIPsToSet(waitedAnswer.ips, qName, h.ID)
+							if _, err := inConn.WriteToUDP(waitedAnswer.payload, addr); err != nil {
 								errlog.Println(err)
 							}
 							answered = true
 						}
 					} else if a.sType == domestic || !waiting || qs[0].Type != dnsmessage.TypeA && qs[0].Type != dnsmessage.TypeAAAA && qs[0].Type != dnsmessage.TypeHTTPS {
 						// assume domestic nameservers can handle A, AAAA and HTTPS properly
+						addIPsToSet(a.ips, qName, h.ID)
 						if _, err := inConn.WriteToUDP(a.payload, addr); err != nil {
 							errlog.Println(err)
 						}
 						answered = true
-					} else if waitedAnswer == nil {
-						waitedAnswer = a.payload
+					} else if waitedAnswer.payload == nil {
+						waitedAnswer = a
 					}
 				}
 			} else {
@@ -428,15 +500,17 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 			}
 		case <-timerWait.C:
 			waiting = false
-			if !answered && waitedAnswer != nil {
-				if _, err := inConn.WriteToUDP(waitedAnswer, addr); err != nil {
+			if !answered && waitedAnswer.payload != nil {
+				addIPsToSet(waitedAnswer.ips, qName, h.ID)
+				if _, err := inConn.WriteToUDP(waitedAnswer.payload, addr); err != nil {
 					errlog.Println(err)
 				}
 				answered = true
 			}
 		case <-timerSafe.C:
-			if !answered && savedAnswer != nil {
-				if _, err := inConn.WriteToUDP(savedAnswer, addr); err != nil {
+			if !answered && savedAnswer.payload != nil {
+				addIPsToSet(savedAnswer.ips, qName, h.ID)
+				if _, err := inConn.WriteToUDP(savedAnswer.payload, addr); err != nil {
 					errlog.Println(err)
 				}
 				answered = true
@@ -453,21 +527,17 @@ func handleQuery(addr *net.UDPAddr, payload []byte, inConn *net.UDPConn) { // ne
 	}
 }
 
-func forwardQueryAndReply(payload []byte, outConn *net.UDPConn, chAnswer chan<- answer, chSave, chFail chan<- []byte, qType dnsmessage.Type, qName string, hasOPT, dnssec bool) {
+func forwardQueryAndReply(payload []byte, outConn *net.UDPConn, chAnswer, chSave chan<- answer, chFail chan<- []byte, qType dnsmessage.Type, qName string, hasOPT, dnssec bool) {
 	defer close(chAnswer)
 	sentTime := time.Now()
-	serversMu.RLock()
 	for _, ns := range servers {
 		outConn.WriteToUDP(payload, ns.udpAddr)
 	}
-	serversMu.RUnlock()
 	outConn.SetReadDeadline(sentTime.Add(time.Duration(*timeout) * time.Millisecond))
 	parseAnswers(outConn, sentTime, chAnswer, chSave, chFail, qType, qName, hasOPT, dnssec)
 }
 
 func lookupServer(addr *net.UDPAddr) (nameserver, bool) {
-	serversMu.RLock()
-	defer serversMu.RUnlock()
 	return lookupServerIn(addr, servers)
 }
 
@@ -480,7 +550,7 @@ func lookupServerIn(addr *net.UDPAddr, list []nameserver) (nameserver, bool) {
 	return nameserver{}, false
 }
 
-func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer, chSave, chFail chan<- []byte, qType dnsmessage.Type, qName string, hasOPT, dnssec bool) {
+func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer, chSave chan<- answer, chFail chan<- []byte, qType dnsmessage.Type, qName string, hasOPT, dnssec bool) {
 	for {
 		var payload [5000]byte
 		// receive from nameserver
@@ -517,6 +587,7 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 		ansCount := 0
 		var bufs []bytes.Buffer
 		reverse := make(map[string]string)
+		var ips []net.IP
 		for {
 			// each loop parses one answer from a reply packet
 			ah, err := p.AnswerHeader()
@@ -540,6 +611,9 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 					ip := net.IP(r.A[:]) //r.A is 4-byte
 					if *reversenet != "" {
 						reverse[ip.String()] = qName
+					}
+					if len(ipsetSpecs) > 0 || len(nftSetSpecs) > 0 {
+						ips = append(ips, ip)
 					}
 					if *verbose {
 						fmt.Fprintf(&buf, " %s %s len %d %dms", ah.Name.String(), ip.String(), len(a), rtt.Nanoseconds()/1000000)
@@ -583,6 +657,9 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 					ip := net.IP(r.AAAA[:])
 					if *reversenet != "" {
 						reverse[ip.String()] = qName
+					}
+					if len(ipsetSpecs) > 0 || len(nftSetSpecs) > 0 {
+						ips = append(ips, ip)
 					}
 					if *verbose {
 						fmt.Fprintf(&buf, " %s %s len %d %dms", ah.Name.String(), ip.String(), len(a), rtt.Nanoseconds()/1000000)
@@ -691,6 +768,9 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 						if *reversenet != "" {
 							reverse[ip.String()] = qName
 						}
+						if len(ipsetSpecs) > 0 || len(nftSetSpecs) > 0 {
+							ips = append(ips, ip)
+						}
 						if ns.sType == domestic && cnIPNet4 != nil {
 							if !findIPInNet(ip, cnIPNet4) {
 								geoErr = true
@@ -717,6 +797,9 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 						}
 						if *reversenet != "" {
 							reverse[ip.String()] = qName
+						}
+						if len(ipsetSpecs) > 0 || len(nftSetSpecs) > 0 {
+							ips = append(ips, ip)
 						}
 						if ns.sType == domestic && cnIPNet6 != nil {
 							if !findIPInNet(ip, cnIPNet6) {
@@ -831,19 +914,19 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 				if *verbose {
 					addTag(bufs, " [ACCEPT]")
 				}
-				chAnswer <- answer{a, domestic}
+				chAnswer <- answer{a, domestic, ips}
 			case foreign:
 				if qType != dnsmessage.TypeA && qType != dnsmessage.TypeAAAA && qType != dnsmessage.TypeHTTPS ||
 					rtt > time.Duration(*minsafe)*time.Millisecond || hasCNAME || ansCount > 1 {
 					if *verbose {
 						addTag(bufs, " [ACCEPT]")
 					}
-					chAnswer <- answer{a, foreign}
+					chAnswer <- answer{a, foreign, ips}
 				} else {
 					if *verbose {
 						addTag(bufs, " [SAVE]")
 					}
-					chSave <- a
+					chSave <- answer{a, foreign, ips}
 				}
 			}
 			// add to cache for reverse lookup (even for those saved but not used)
@@ -858,7 +941,7 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 		} else {
 			// send empty answer to signal that domestic has replied
 			if ns.sType == domestic {
-				chAnswer <- answer{nil, domestic}
+				chAnswer <- answer{nil, domestic, nil}
 			}
 			if *verbose {
 				addTag(bufs, " [DROP]")
@@ -867,6 +950,82 @@ func parseAnswers(conn *net.UDPConn, sentTime time.Time, chAnswer chan<- answer,
 		if *verbose {
 			for _, buf := range bufs {
 				logger.Println(&buf)
+			}
+		}
+	}
+}
+
+func parseNFTSetSpec(spec string) (nftSetConfig, error) {
+	s := spec
+	var cfg nftSetConfig
+	// Check for 4# or 6# prefix
+	if len(s) > 2 && s[1] == '#' {
+		switch s[0] {
+		case '4':
+			cfg.v4Only = true
+			s = s[2:]
+		case '6':
+			cfg.v6Only = true
+			s = s[2:]
+		}
+	}
+	parts := strings.SplitN(s, "#", 3)
+	switch len(parts) {
+	case 2:
+		cfg.family = "inet"
+		cfg.table = parts[0]
+		cfg.setName = parts[1]
+	case 3:
+		cfg.family = parts[0]
+		cfg.table = parts[1]
+		cfg.setName = parts[2]
+	default:
+		return nftSetConfig{}, fmt.Errorf("invalid nftset spec %q (expected [4#|6#][family#]table#set)", spec)
+	}
+	if cfg.family != "ip" && cfg.family != "ip6" && cfg.family != "inet" {
+		return nftSetConfig{}, fmt.Errorf("invalid nftset family %q (must be ip, ip6, or inet)", cfg.family)
+	}
+	return cfg, nil
+}
+
+func addIPsToSet(ips []net.IP, qName string, id uint16) {
+	if len(ips) == 0 {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, ip := range ips {
+		s := ip.String()
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		is4 := ip.To4() != nil
+		for _, spec := range ipsetSpecs {
+			if !domainMatch(qName, spec.domains) {
+				continue
+			}
+			if err := ipsetAddToSet(spec.setName, ip); err != nil {
+				errlog.Printf("ipset add %s %s: %v", spec.setName, s, err)
+			} else if *verbose {
+				logger.Printf("%d ipset %s <- %s (%s)", id, spec.setName, s, qName)
+			}
+		}
+		for _, spec := range nftSetSpecs {
+			if !domainMatch(qName, spec.domains) {
+				continue
+			}
+			set := spec.config
+			if (is4 && set.family == "ip6") || (!is4 && set.family == "ip") {
+				continue
+			}
+			if set.v4Only && !is4 || set.v6Only && is4 {
+				continue
+			}
+			cmd := exec.Command("nft", "add", "element", set.family, set.table, set.setName, "{", s, "}")
+			if err := cmd.Run(); err != nil {
+				errlog.Printf("nft add element %s %s %s { %s }: %v", set.family, set.table, set.setName, s, err)
+			} else if *verbose {
+				logger.Printf("%d nftset %s#%s#%s <- %s (%s)", id, set.family, set.table, set.setName, s, qName)
 			}
 		}
 	}
@@ -900,9 +1059,14 @@ func parseConfig(filename string) (map[string]string, error) {
 			return nil, fmt.Errorf("config line %d: unknown option %q", lineno, key)
 		}
 		if _, dup := cfg[key]; dup {
-			return nil, fmt.Errorf("config line %d: duplicate option %q", lineno, key)
+			if key == "ipset" || key == "nftset" {
+				cfg[key] += "\n" + val
+			} else {
+				return nil, fmt.Errorf("config line %d: duplicate option %q", lineno, key)
+			}
+		} else {
+			cfg[key] = val
 		}
-		cfg[key] = val
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -986,6 +1150,53 @@ func applyConfig(cfg map[string]string, cliSet map[string]bool) error {
 			*cachelife = n
 		}
 	}
+	if runtime.GOOS != "linux" {
+		if _, ok := cfg["ipset"]; ok {
+			logger.Print("Warning: ipset option ignored (Linux only)")
+		}
+		if _, ok := cfg["nftset"]; ok {
+			logger.Print("Warning: nftset option ignored (Linux only)")
+		}
+		return nil
+	}
+	if raw, ok := cfg["ipset"]; ok {
+		var specs []ipsetSpec
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			domains, names := parseSetDomains(line)
+			if len(names) == 0 {
+				return fmt.Errorf("invalid ipset spec: %s", line)
+			}
+			for _, name := range names {
+				specs = append(specs, ipsetSpec{domains: domains, setName: name})
+			}
+		}
+		parsedIPSetSpecs = specs
+	}
+	if raw, ok := cfg["nftset"]; ok {
+		var specs []nftSetSpec
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			domains, names := parseSetDomains(line)
+			if len(names) == 0 {
+				return fmt.Errorf("invalid nftset spec: %s", line)
+			}
+			for _, name := range names {
+				cfg, err := parseNFTSetSpec(name)
+				if err != nil {
+					return err
+				}
+				specs = append(specs, nftSetSpec{domains: domains, config: cfg})
+			}
+		}
+		parsedNFTSetSpecs = specs
+	}
 	return nil
 }
 
@@ -1045,14 +1256,31 @@ func loadConfig() error {
 		*minrtt = 0
 	}
 
-	// Atomically swap global state
+	// Parse ipset/nftset configs
+	for _, spec := range parsedIPSetSpecs {
+		if len(spec.domains) > 0 {
+			logger.Printf("ipset: %s -> %s", strings.Join(spec.domains, ", "), spec.setName)
+		} else {
+			logger.Printf("ipset: %s (all)", spec.setName)
+		}
+	}
+	for _, spec := range parsedNFTSetSpecs {
+		nft := spec.config
+		if len(spec.domains) > 0 {
+			logger.Printf("nftset: %s -> %s#%s#%s", strings.Join(spec.domains, ", "), nft.family, nft.table, nft.setName)
+		} else {
+			logger.Printf("nftset: %s#%s#%s (all)", nft.family, nft.table, nft.setName)
+		}
+	}
+
+	// Update global state
 	cnIPNet4 = newIPNet4
 	cnIPNet6 = newIPNet6
 	blackIPs4 = newBlack4
 	blackIPs6 = newBlack6
-	serversMu.Lock()
+	ipsetSpecs = parsedIPSetSpecs
+	nftSetSpecs = parsedNFTSetSpecs
 	servers = newServers
-	serversMu.Unlock()
 
 	return nil
 }
@@ -1077,6 +1305,10 @@ func reloadConfig() {
 	if err := loadConfig(); err != nil {
 		errlog.Printf("Config reload failed: %v", err)
 		return
+	}
+
+	if len(ipsetSpecs) > 0 && ipsetSock < 0 {
+		ipsetInit()
 	}
 	logger.Print("Configuration reloaded successfully")
 }
@@ -1119,6 +1351,11 @@ func main() {
 
 	if err := loadConfig(); err != nil {
 		errlog.Fatalln(err)
+	}
+
+	if len(ipsetSpecs) > 0 {
+		ipsetInit()
+		defer ipsetClose()
 	}
 
 	addr, err := parseUDPAddr(*localnet)
