@@ -94,7 +94,11 @@ func nftAddElements(batches map[nftSetKey][]net.IP, qName string, id uint16) {
 			setBatches[key] = b
 		}
 		for _, ip := range ips {
-			b.elements = append(b.elements, nftables.SetElement{Key: ip})
+			b.elements = append(b.elements, nftables.SetElement{
+				Key:     ip,
+				Timeout: b.set.Timeout,
+				Expires: b.set.Timeout,
+			})
 		}
 	}
 

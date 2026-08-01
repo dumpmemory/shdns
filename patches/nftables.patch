@@ -1,0 +1,12 @@
+--- a/set.go
++++ b/set.go
+@@ -421,6 +421,9 @@
+ 			// Set has Timeout flag set, which means an individual element can specify its own timeout.
+ 			item = append(item, netlink.Attribute{Type: unix.NFTA_SET_ELEM_TIMEOUT, Data: binaryutil.BigEndian.PutUint64(uint64(v.Timeout.Milliseconds()))})
+ 		}
++		if s.HasTimeout && v.Expires != 0 {
++			item = append(item, netlink.Attribute{Type: unix.NFTA_SET_ELEM_EXPIRATION, Data: binaryutil.BigEndian.PutUint64(uint64(v.Expires.Milliseconds()))})
++		}
+ 		// The following switch statement deal with 3 different types of elements.
+ 		// 1. v is an element of vmap
+ 		// 2. v is an element of a regular map
